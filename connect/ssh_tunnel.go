@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"sync"
 
 	"github.com/juju/errgo/errors"
 	"golang.org/x/crypto/ssh"
@@ -46,7 +45,7 @@ func sshConfig(tunnelConfig *SSHTunnelConfig) (*ssh.ClientConfig, error) {
 	return sshConfig, nil
 }
 
-func handleConnection(localListener net.Listener, sshServerAddrString, remoteAddrString string, sshConfig *ssh.ClientConfig, quitCond *sync.Cond) error {
+func handleConnection(localListener net.Listener, sshServerAddrString, remoteAddrString string, sshConfig *ssh.ClientConfig, quit chan bool) error {
 
 	localConn, err := localListener.Accept()
 	if err != nil {
@@ -65,7 +64,7 @@ func handleConnection(localListener net.Listener, sshServerAddrString, remoteAdd
 	log.Println("Established ssh connection")
 
 	go func() {
-		quitCond.Wait()
+		<-quit
 		log.Println("Got quit message for connection!")
 		log.Println("Closing local connection")
 		localConn.Close()
@@ -86,27 +85,32 @@ func handleConnection(localListener net.Listener, sshServerAddrString, remoteAdd
 		_, err = io.Copy(remoteConn, localConn)
 		if err != nil {
 			log.Println("io.Copy from local to remote connection returned error:", err)
-			localConn.Close()
-			sshConn.Close()
 		} else {
-			log.Println("io.Copy from remote to local connection finished")
+			log.Println("io.Copy from local to remote connection finished")
 		}
+		log.Println("Closing local connection")
+		localConn.Close()
+		log.Println("Closing ssh connection")
+		sshConn.Close()
 	}()
 
 	go func() {
 		_, err = io.Copy(localConn, remoteConn)
 		if err != nil {
 			log.Println("io.Copy from remote to local connection returned error:", err)
-			localConn.Close()
-			sshConn.Close()
 		} else {
 			log.Println("io.Copy from remote to local connection finished")
 		}
+		log.Println("Closing local connection")
+		localConn.Close()
+		log.Println("Closing ssh connection")
+		sshConn.Close()
 	}()
 
 	return nil
 }
 
+// Is blocking call.
 func RunSSHTunnel(tunnelConfig *SSHTunnelConfig, quit chan bool) error {
 
 	sshConfig, err := sshConfig(tunnelConfig)
@@ -128,10 +132,7 @@ func RunSSHTunnel(tunnelConfig *SSHTunnelConfig, quit chan bool) error {
 
 	log.Println("Created listening socket")
 
-	m := &sync.Mutex{}
-	m.Lock()
-	connQuitCond := sync.NewCond(m)
-	forQuit := make(chan bool)
+	connQuit := make(chan bool)
 
 	go func() {
 		<-quit
@@ -139,19 +140,17 @@ func RunSSHTunnel(tunnelConfig *SSHTunnelConfig, quit chan bool) error {
 		log.Println("Closing listening socket")
 		localListener.Close()
 		log.Println("Broadcasting quit to connections")
-		connQuitCond.Broadcast()
-		log.Println("Breaking listening loop")
-		forQuit <- true
+		close(connQuit)
 	}()
 
 	done := false
 	for !done {
 		select {
-		case <-forQuit:
+		case <-connQuit:
 			log.Println("Got listening loop break message!")
 			done = true
 		default:
-			err = handleConnection(localListener, sshServerAddrString, remoteAddrString, sshConfig, connQuitCond)
+			err = handleConnection(localListener, sshServerAddrString, remoteAddrString, sshConfig, connQuit)
 			if err != nil {
 				log.Println("handleConnection error:", err)
 			}
